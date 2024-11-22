@@ -12,7 +12,7 @@ from mir_eval import separation
 import numpy as np
 
 class SimpleTCN(nn.Module):
-    def __init__(self, in_channels=2, hidden_size=256, num_layers=5, dilation_rate=2, multi_scale_kernels=[3, 5, 7]):
+    def __init__(self, in_channels=2, hidden_size=256, num_layers=5, dilation_rate=1, multi_scale_kernels=[3, 5, 7]):
         super(SimpleTCN, self).__init__()
         self.in_channels = in_channels
         self.hidden_size = hidden_size
@@ -277,7 +277,7 @@ def validate(model, dataloader, loss_fn, device):
     return avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
-              chunk_size=8192, device='cpu'):
+              chunk_size=441000, device='cpu'):
     # Load model weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
     print("Checkpoint keys:", checkpoint.keys())  # Debug print
@@ -335,11 +335,8 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
     # Concatenate all chunks
     instrumentals = torch.cat(instrumentals, dim=1)
 
-    # Ensure the instrumentals tensor does not exceed the range [-1, 1]
-    instrumentals.clamp_(-1, 1)
-
     # Save the separated instrumentals
-    torchaudio.save(output_instrumentals_path, instrumentals.cpu(), sr, encoding='PCM_S', bits_per_sample=16)
+    torchaudio.save(output_instrumentals_path, instrumentals.cpu(), sr)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for music voice separation')
