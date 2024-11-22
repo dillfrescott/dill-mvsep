@@ -277,7 +277,7 @@ def validate(model, dataloader, loss_fn, device):
     return avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
-              chunk_size=16384, device='cpu'):
+              chunk_size=8192, device='cpu'):
     # Load model weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
     print("Checkpoint keys:", checkpoint.keys())  # Debug print
@@ -300,17 +300,25 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
     # Initialize variables for chunk processing
     total_length = mixture.shape[1]
     num_chunks = (total_length + chunk_size - 1) // chunk_size  # Ceiling division
-    instrumentals = torch.zeros_like(mixture)
+    instrumentals = []
 
     # Process audio in chunks with a progress bar
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length, chunk_size):
-            chunk = mixture[:, i:i + chunk_size]
+            # Handle the last chunk
+            if i + chunk_size > total_length:
+                padding_length = i + chunk_size - total_length
+                padding = torch.zeros(2, padding_length, device=device)
+                chunk = torch.cat([mixture[:, i:], padding], dim=1)
+            else:
+                chunk = mixture[:, i:i + chunk_size]
             chunk = chunk.unsqueeze(0)  # Add batch dimension
 
             # Inference
             with torch.no_grad():
                 vocals_pred = model(chunk)
+                # Ensure shapes match
+                assert chunk.shape == vocals_pred.shape, "Chunk and vocals_pred shapes do not match."
                 inst_chunk = chunk - vocals_pred
 
             # Denormalize instrumentals
@@ -319,14 +327,19 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
             # Remove batch dimension
             inst_chunk = inst_chunk.squeeze(0)
 
-            # Place the chunk in the final instrumentals tensor
-            end = i + chunk.shape[2]
-            instrumentals[:, i:end] = inst_chunk
+            # Append the chunk to the list of instrumentals
+            instrumentals.append(inst_chunk)
 
             pbar.update(1)
 
+    # Concatenate all chunks
+    instrumentals = torch.cat(instrumentals, dim=1)
+
+    # Ensure the instrumentals tensor does not exceed the range [-1, 1]
+    instrumentals.clamp_(-1, 1)
+
     # Save the separated instrumentals
-    torchaudio.save(output_instrumentals_path, instrumentals.cpu(), sr)
+    torchaudio.save(output_instrumentals_path, instrumentals.cpu(), sr, encoding='PCM_S', bits_per_sample=16)
 
 def main():
     parser = argparse.ArgumentParser(description='Train a model for music voice separation')
@@ -348,7 +361,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleTCN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
+    model = SimpleTCN(in_channels=2, hidden_size=128, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -375,7 +388,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleTCN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
+        model = SimpleTCN(in_channels=2, hidden_size=128, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device)
     else:
