@@ -11,14 +11,15 @@ from prodigyopt import Prodigy
 from mir_eval import separation
 import numpy as np
 
-# Define a simpler CNN model with configurable number of layers
-class SimpleCNN(nn.Module):
-    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=2):
-        super(SimpleCNN, self).__init__()
+class SimpleTCN(nn.Module):
+    def __init__(self, in_channels=2, hidden_size=256, num_layers=5, dilation_rate=2, multi_scale_kernels=[3, 5, 7]):
+        super(SimpleTCN, self).__init__()
         self.in_channels = in_channels
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.dilation_rate = dilation_rate
+        self.multi_scale_kernels = multi_scale_kernels
+        self.num_multi_scale = len(multi_scale_kernels)
 
         # First layer
         self.conv1 = nn.Conv1d(in_channels, hidden_size, kernel_size=3, padding=1)
@@ -33,15 +34,20 @@ class SimpleCNN(nn.Module):
             self.bns.append(nn.BatchNorm1d(hidden_size))
 
         # Last layer
-        self.conv_last = nn.Conv1d(hidden_size, in_channels, kernel_size=3, padding=1)
+        self.conv_last = nn.Conv1d(hidden_size * self.num_multi_scale, in_channels, kernel_size=3, padding=1)
 
         # Attention mechanism
         self.attention = nn.Sequential(
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+            nn.Conv1d(hidden_size * self.num_multi_scale, hidden_size * self.num_multi_scale, kernel_size=1),
             nn.ReLU(),
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+            nn.Conv1d(hidden_size * self.num_multi_scale, hidden_size * self.num_multi_scale, kernel_size=1),
             nn.Sigmoid()
         )
+
+        # Multi-scale processing
+        self.multi_scale_convs = nn.ModuleList([
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=k, padding=(k-1)//2) for k in multi_scale_kernels
+        ])
 
         # Upsampling and downsampling
         self.upsample = nn.Upsample(scale_factor=2, mode='linear')
@@ -56,6 +62,12 @@ class SimpleCNN(nn.Module):
             residual = x
             x = F.relu(bn(conv(x)))
             x = x + residual  # Residual connection
+
+        # Multi-scale processing
+        multi_scale_outputs = []
+        for conv in self.multi_scale_convs:
+            multi_scale_outputs.append(conv(x))
+        x = torch.cat(multi_scale_outputs, dim=1)
 
         # Attention mechanism
         attn = self.attention(x)
@@ -177,7 +189,6 @@ def validate(model, dataloader, loss_fn, device):
     sdr_instrumentals = []
 
     with torch.no_grad():
-        # Create a tqdm progress bar
         pbar = tqdm(total=len(dataloader), desc="Validation Progress")
 
         for batch_idx, (mixture, vocals) in enumerate(dataloader):
@@ -187,42 +198,48 @@ def validate(model, dataloader, loss_fn, device):
             loss = loss_fn(vocals_pred, vocals)
             val_loss += loss.item()
 
-            # Convert tensors to numpy arrays
             mixture_np = mixture.cpu().numpy()
             vocals_np = vocals.cpu().numpy()
             vocals_pred_np = vocals_pred.cpu().numpy()
 
-            # Compute instrumentals
             instrumentals_true_np = mixture_np - vocals_np
             instrumentals_pred_np = mixture_np - vocals_pred_np
 
-            # Compute SDR for each sample in the batch
             batch_sdr_vocals = []
             batch_sdr_instrumentals = []
             for j in range(mixture_np.shape[0]):
-                # For sample j
                 ref_vocals = vocals_np[j]
                 ref_instrumentals = instrumentals_true_np[j]
                 est_vocals = vocals_pred_np[j]
                 est_instrumentals = instrumentals_pred_np[j]
 
-                # Detect and ignore silent areas
+                # Ensure masks do not remove all samples
                 ref_vocals_mask = np.abs(ref_vocals).mean(axis=0) > 1e-5
-                ref_instrumentals_mask = np.abs(ref_instrumentals).mean(axis=0) > 1e-5
-                est_vocals_mask = np.abs(est_vocals).mean(axis=0) > 1e-5
-                est_instrumentals_mask = np.abs(est_instrumentals).mean(axis=0) > 1e-5
-
-                # Apply masks to ignore silent areas
+                if not np.any(ref_vocals_mask):
+                    ref_vocals_mask = np.ones(ref_vocals.shape[1], dtype=bool)
                 ref_vocals = ref_vocals[:, ref_vocals_mask]
-                ref_instrumentals = ref_instrumentals[:, ref_instrumentals_mask]
-                est_vocals = est_vocals[:, est_vocals_mask]
-                est_instrumentals = est_instrumentals[:, est_instrumentals_mask]
 
-                # Ensure all arrays have the same number of dimensions
-                ref_vocals = ref_vocals[np.newaxis, :, :] if ref_vocals.ndim == 1 else ref_vocals
-                ref_instrumentals = ref_instrumentals[np.newaxis, :, :] if ref_instrumentals.ndim == 1 else ref_instrumentals
-                est_vocals = est_vocals[np.newaxis, :, :] if est_vocals.ndim == 1 else est_vocals
-                est_instrumentals = est_instrumentals[np.newaxis, :, :] if est_instrumentals.ndim == 1 else est_instrumentals
+                ref_instrumentals_mask = np.abs(ref_instrumentals).mean(axis=0) > 1e-5
+                if not np.any(ref_instrumentals_mask):
+                    ref_instrumentals_mask = np.ones(ref_instrumentals.shape[1], dtype=bool)
+                ref_instrumentals = ref_instrumentals[:, ref_instrumentals_mask]
+
+                # Ensure arrays are 2D
+                if ref_vocals.ndim == 1:
+                    ref_vocals = ref_vocals[np.newaxis, :]
+                if ref_instrumentals.ndim == 1:
+                    ref_instrumentals = ref_instrumentals[np.newaxis, :]
+                if est_vocals.ndim == 1:
+                    est_vocals = est_vocals[np.newaxis, :]
+                if est_instrumentals.ndim == 1:
+                    est_instrumentals = est_instrumentals[np.newaxis, :]
+
+                # Calculate max length based on the last dimension
+                max_length = max(ref_vocals.shape[1], ref_instrumentals.shape[1])
+                pad_vocals = ((0, 0), (0, max_length - ref_vocals.shape[1]))
+                pad_instrumentals = ((0, 0), (0, max_length - ref_instrumentals.shape[1]))
+                ref_vocals = np.pad(ref_vocals, pad_vocals, mode='constant')
+                ref_instrumentals = np.pad(ref_instrumentals, pad_instrumentals, mode='constant')
 
                 # Stack references and estimates
                 ref = np.vstack([ref_vocals, ref_instrumentals])
@@ -331,7 +348,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+    model = SimpleTCN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -358,7 +375,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+        model = SimpleTCN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device)
     else:
