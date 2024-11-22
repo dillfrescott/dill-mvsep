@@ -1,1 +1,1 @@
-## Highly experimental. Does NOT work well right now!
+## Highly experimental. Heavy work in progress.
