@@ -13,31 +13,61 @@ import numpy as np
 
 # Define a simpler CNN model with configurable number of layers
 class SimpleCNN(nn.Module):
-    def __init__(self, in_channels=2, hidden_size=512, num_layers=3):
+    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=2):
         super(SimpleCNN, self).__init__()
         self.in_channels = in_channels
         self.hidden_size = hidden_size
         self.num_layers = num_layers
+        self.dilation_rate = dilation_rate
 
         # First layer
         self.conv1 = nn.Conv1d(in_channels, hidden_size, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(hidden_size)
 
-        # Intermediate layers
+        # Intermediate layers with residual connections and dilated convolutions
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
-        for _ in range(num_layers - 2):
-            self.convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=1))
+        self.dilation_rates = [dilation_rate ** i for i in range(num_layers - 2)]
+        for dilation in self.dilation_rates:
+            self.convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=dilation, dilation=dilation))
             self.bns.append(nn.BatchNorm1d(hidden_size))
 
         # Last layer
         self.conv_last = nn.Conv1d(hidden_size, in_channels, kernel_size=3, padding=1)
 
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+        # Upsampling and downsampling
+        self.upsample = nn.Upsample(scale_factor=2, mode='linear')
+        self.downsample = nn.AvgPool1d(kernel_size=2)
+
     def forward(self, x):
+        # First layer
         x = F.relu(self.bn1(self.conv1(x)))
-        for conv, bn in zip(self.convs, self.bns):
+
+        # Intermediate layers with residual connections and dilated convolutions
+        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+            residual = x
             x = F.relu(bn(conv(x)))
+            x = x + residual  # Residual connection
+
+        # Attention mechanism
+        attn = self.attention(x)
+        x = x * attn
+
+        # Upsampling and downsampling
+        x = self.upsample(x)
+        x = self.downsample(x)
+
+        # Last layer
         x = self.conv_last(x)
+
         return x
 
 # Custom Dataset class with normalization
@@ -301,7 +331,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=1024, num_layers=args.num_layers)
+    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -328,7 +358,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=1024, num_layers=args.num_layers)
+        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device)
     else:
