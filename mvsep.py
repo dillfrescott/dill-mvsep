@@ -344,7 +344,7 @@ def main():
         val_dataloader = None
         if args.val_dir:
             val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=args.segment_length)
-            val_dataloader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+            val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)  # Always batch size of 1
 
         # Initialize scheduler
         total_steps = args.epochs * len(train_dataloader)
