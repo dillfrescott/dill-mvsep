@@ -107,8 +107,7 @@ class MUSDBDataset(Dataset):
         return mixture_spec, vocals_spec, mixture, vocals
 
 # Training function with loss logging
-def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, checkpoint_steps,
-          val_dataloader=None, checkpoint_path=None):
+def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, checkpoint_steps, checkpoint_path=None):
     model.to(device)
     step = 0
     avg_loss = 0.0
@@ -144,30 +143,12 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
 
             if step % checkpoint_steps == 0:
-                # Save checkpoint before validation
+                # Save checkpoint
                 torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'avg_loss': avg_loss,
-                    'loss_log': loss_log
-                }, f"checkpoint_step_{step}.pt")
-
-                if val_dataloader:
-                    avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals = validate(model, val_dataloader, loss_fn, device)
-                    desc += f" - Val Loss: {avg_val_loss:.4f}, SDR Vocals: {avg_sdr_vocals:.4f}, SDR Instrumentals: {avg_sdr_instrumentals:.4f}"
-                else:
-                    avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals = None, None, None
-
-                # Save checkpoint after validation
-                torch.save({
-                    'step': step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'avg_loss': avg_loss,
-                    'val_loss': avg_val_loss,
-                    'sdr_vocals': avg_sdr_vocals,
-                    'sdr_instrumentals': avg_sdr_instrumentals,
                     'loss_log': loss_log
                 }, f"checkpoint_step_{step}.pt")
 
@@ -176,129 +157,6 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
-
-def validate(model, dataloader, loss_fn, device, chunk_size=16384, overlap=4096, n_fft=2048, hop_length=512):
-    model.eval()
-    sdr_vocals = []
-    sdr_instrumentals = []
-
-    # Create a Hann window
-    window = torch.hann_window(n_fft).to(device)
-
-    with torch.no_grad():
-        # Create a tqdm progress bar
-        pbar = tqdm(total=len(dataloader), desc="Validation Progress")
-
-        for batch_idx, (mixture, vocals, _, _) in enumerate(dataloader):
-            mixture = mixture.to(device)
-            vocals = vocals.to(device)
-
-            # Initialize variables for chunk processing
-            total_length = mixture.shape[1]
-            num_chunks = (total_length - overlap) // (chunk_size - overlap)
-            instrumentals = torch.zeros_like(mixture)
-
-            # Define cross-fade length
-            cross_fade_length = overlap // 2
-
-            # Process audio in chunks with a sliding window and cross-fade
-            for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
-                chunk = mixture[:, i:i + chunk_size]
-
-                # Convert chunk to spectrogram
-                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
-                chunk_mag = torch.abs(chunk_spec)
-                chunk_phase = torch.angle(chunk_spec)
-
-                # Normalize chunk magnitude spectrogram
-                chunk_mag_mean = chunk_mag.mean(dim=(1, 2), keepdim=True)
-                chunk_mag_std = chunk_mag.std(dim=(1, 2), keepdim=True)
-                chunk_mag_normalized = (chunk_mag - chunk_mag_mean) / (chunk_mag_std + 1e-8)
-
-                # Add batch dimension
-                chunk_mag_normalized = chunk_mag_normalized.unsqueeze(0)
-
-                # Inference
-                with torch.no_grad():
-                    inst_mag = model(chunk_mag_normalized)
-
-                # Remove batch dimension
-                inst_mag = inst_mag.squeeze(0)
-
-                # Denormalize the output
-                inst_mag = inst_mag * chunk_mag_std + chunk_mag_mean
-
-                # Reconstruct the complex spectrogram
-                inst_spec = inst_mag * torch.exp(1j * chunk_phase)
-
-                # Convert spectrogram back to waveform
-                inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
-
-                # Cross-fade the overlapping regions
-                if i > 0:
-                    fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
-                    fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
-
-                    # Apply fade-in to the new chunk
-                    inst_chunk[:, :cross_fade_length] *= fade_in
-
-                    # Apply fade-out to the previous chunk
-                    instrumentals[:, i:i + cross_fade_length] *= fade_out
-
-                    # Add the cross-faded regions
-                    instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
-
-                # Place the non-overlapping part of the chunk in the final instrumentals tensor
-                instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
-
-            # Apply clipping to avoid extreme values
-            instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
-
-            # Calculate SDR for each sample in the batch
-            batch_sdr_vocals = []
-            batch_sdr_instrumentals = []
-            for j in range(mixture.shape[0]):
-                ref_vocals = vocals[j].cpu().numpy()
-                ref_instrumentals = mixture[j].cpu().numpy() - ref_vocals
-                est_instrumentals = instrumentals[j].cpu().numpy()
-
-                # Invert the phase to get the vocal part
-                est_vocals = mixture[j].cpu().numpy() - est_instrumentals
-
-                # Check if estimated sources are all zeros
-                if np.all(est_vocals == 0) or np.all(est_instrumentals == 0):
-                    print(f"Warning: Estimated source is all zeros for batch {batch_idx}, sample {j}. Skipping SDR calculation.")
-                    continue
-
-                # Compute SDR
-                sdr, _, _, _ = separation.bss_eval_sources(ref_vocals, est_vocals)
-                batch_sdr_vocals.append(sdr[0])
-
-                sdr, _, _, _ = separation.bss_eval_sources(ref_instrumentals, est_instrumentals)
-                batch_sdr_instrumentals.append(sdr[0])
-
-            # Update the progress bar with the current batch SDRs
-            if batch_sdr_vocals and batch_sdr_instrumentals:
-                avg_batch_sdr_vocals = sum(batch_sdr_vocals) / len(batch_sdr_vocals)
-                avg_batch_sdr_instrumentals = sum(batch_sdr_instrumentals) / len(batch_sdr_instrumentals)
-                pbar.set_postfix({
-                    "SDR (Vocals)": f"{avg_batch_sdr_vocals:.4f}",
-                    "SDR (Instrumentals)": f"{avg_batch_sdr_instrumentals:.4f}"
-                })
-            pbar.update(1)
-
-            # Append batch SDRs to the overall SDR lists
-            sdr_vocals.extend(batch_sdr_vocals)
-            sdr_instrumentals.extend(batch_sdr_instrumentals)
-
-        pbar.close()
-
-    model.train()
-    avg_sdr_vocals = sum(sdr_vocals) / len(sdr_vocals) if sdr_vocals else 0.0
-    avg_sdr_instrumentals = sum(sdr_instrumentals) / len(sdr_instrumentals) if sdr_instrumentals else 0.0
-    print(f"Validation - Avg SDR (Vocals): {avg_sdr_vocals:.4f}")
-    print(f"Validation - Avg SDR (Instrumentals): {avg_sdr_instrumentals:.4f}")
-    return avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
               chunk_size=16384, overlap=4096, device='cpu', n_fft=2048, hop_length=512):
@@ -390,7 +248,6 @@ def main():
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='path/to/musdb18', help='Path to MUSDB18 training dataset')
-    parser.add_argument('--val_dir', type=str, default=None, help='Path to MUSDB18 validation dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate')
@@ -416,19 +273,13 @@ def main():
         train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
-        # Create validation dataset and dataloader if provided
-        val_dataloader = None
-        if args.val_dir:
-            val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=None, n_fft=args.n_fft, hop_length=args.hop_length, segment=False)
-            val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)  # Always batch size of 1
-
         # Initialize scheduler
         total_steps = args.epochs * len(train_dataloader)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
         # Start training
         train(model, train_dataloader, optimizer, scheduler, loss_fn, device, args.epochs,
-              args.checkpoint_steps, val_dataloader=val_dataloader, checkpoint_path=args.checkpoint_path)
+              args.checkpoint_steps, checkpoint_path=args.checkpoint_path)
     elif args.infer:
         if args.input_wav is None:
             print("Please specify an input WAV file for inference using --input_wav")
