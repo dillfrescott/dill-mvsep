@@ -278,30 +278,33 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
 
             # Convert chunk to spectrogram
             chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, return_complex=True)
-            chunk_spec = torch.abs(chunk_spec)
+            chunk_mag = torch.abs(chunk_spec)
+            chunk_phase = torch.angle(chunk_spec)
 
-            # Normalize chunk spectrogram
-            chunk_spec_mean = chunk_spec.mean(dim=(1, 2), keepdim=True)
-            chunk_spec_std = chunk_spec.std(dim=(1, 2), keepdim=True)
-            chunk_spec_normalized = (chunk_spec - chunk_spec_mean) / (chunk_spec_std + 1e-8)
+            # Normalize chunk magnitude spectrogram
+            chunk_mag_mean = chunk_mag.mean(dim=(1, 2), keepdim=True)
+            chunk_mag_std = chunk_mag.std(dim=(1, 2), keepdim=True)
+            chunk_mag_normalized = (chunk_mag - chunk_mag_mean) / (chunk_mag_std + 1e-8)
 
             # Add batch dimension
-            chunk_spec_normalized = chunk_spec_normalized.unsqueeze(0)
+            chunk_mag_normalized = chunk_mag_normalized.unsqueeze(0)
 
             # Inference
             with torch.no_grad():
-                vocals_spec_pred = model(chunk_spec_normalized)
-                inst_spec = chunk_spec_normalized - vocals_spec_pred
+                vocals_mag_pred = model(chunk_mag_normalized)
+                inst_mag = chunk_mag_normalized - vocals_mag_pred
 
             # Remove batch dimension
-            inst_spec = inst_spec.squeeze(0)
+            inst_mag = inst_mag.squeeze(0)
 
             # Denormalize the output
-            inst_spec = inst_spec * chunk_spec_std + chunk_spec_mean
+            inst_mag = inst_mag * chunk_mag_std + chunk_mag_mean
+
+            # Reconstruct the complex spectrogram
+            inst_spec = inst_mag * torch.exp(1j * chunk_phase)
 
             # Convert spectrogram back to waveform
-            inst_spec = torch.complex(inst_spec, torch.zeros_like(inst_spec))
-            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, length=chunk_size)
+            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, length=chunk_size, normalized=False, onesided=True, return_complex=False)
 
             # Cross-fade the overlapping regions
             if i > 0:
