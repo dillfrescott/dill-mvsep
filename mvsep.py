@@ -60,6 +60,7 @@ class MUSDBDataset(Dataset):
         self.hop_length = hop_length
         self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
+        self.window = torch.hann_window(n_fft)
 
     def __len__(self):
         return len(self.tracks)
@@ -78,9 +79,9 @@ class MUSDBDataset(Dataset):
         mixture = mixture[:, :min_length]
         vocals = vocals[:, :min_length]
 
-        # Convert to spectrograms
-        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=False)
-        vocals_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=False)
+        # Convert to spectrograms with Hann window
+        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=False)
+        vocals_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, window=self.window, return_complex=False)
 
         # Ensure the last dimension is of size 2 (real and imaginary parts)
         if mixture_spec.shape[-1] != 2 or vocals_spec.shape[-1] != 2:
@@ -188,7 +189,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
 
-            # Convert chunk to spectrogram
+            # Convert chunk to spectrogram with Hann window
             chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
@@ -215,7 +216,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
             # Reconstruct the complex spectrogram
             inst_spec = inst_mag * torch.exp(1j * chunk_phase)
 
-            # Convert spectrogram back to waveform
+            # Convert spectrogram back to waveform with Hann window
             inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
 
             # Cross-fade the overlapping regions
