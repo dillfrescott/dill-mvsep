@@ -256,7 +256,7 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
-    parser.add_argument('--num_layers', type=int, default=8, help='Number of layers in the CNN model')
+    parser.add_argument('--num_layers', type=int, default=12, help='Number of layers in the CNN model')
     parser.add_argument('--n_fft', type=int, default=2048, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=512, help='Hop length for STFT')
     args = parser.parse_args()
