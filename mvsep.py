@@ -52,12 +52,13 @@ class SimpleCNN(nn.Module):
 
 # Custom Dataset class with normalization and spectrogram conversion
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=2048, hop_length=512):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=2048, hop_length=512, segment=True):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
         self.n_fft = n_fft
         self.hop_length = hop_length
+        self.segment = segment
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
 
     def __len__(self):
@@ -90,7 +91,7 @@ class MUSDBDataset(Dataset):
         vocals_spec = (vocals_spec - vocals_spec.mean(dim=(1, 2), keepdim=True)) / (vocals_spec.std(dim=(1, 2), keepdim=True) + 1e-8)
 
         # Optionally segment the signals
-        if self.segment_length:
+        if self.segment and self.segment_length:
             if mixture_spec.shape[2] >= self.segment_length // self.hop_length:
                 start = torch.randint(0, mixture_spec.shape[2] - self.segment_length // self.hop_length, (1,))
                 mixture_spec = mixture_spec[:, :, start:start + self.segment_length // self.hop_length]
@@ -99,7 +100,7 @@ class MUSDBDataset(Dataset):
                 mixture_spec = F.pad(mixture_spec, (0, self.segment_length // self.hop_length - mixture_spec.shape[2]))
                 vocals_spec = F.pad(vocals_spec, (0, self.segment_length // self.hop_length - vocals_spec.shape[2]))
 
-        return mixture_spec, vocals_spec
+        return mixture_spec, vocals_spec, mixture, vocals
 
 # Training function with loss logging
 def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, checkpoint_steps,
@@ -121,7 +122,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
     model.train()
     for epoch in range(epochs):
-        for mixture_spec, vocals_spec in dataloader:
+        for mixture_spec, vocals_spec, _, _ in dataloader:
             mixture_spec = mixture_spec.to(device)
             vocals_spec = vocals_spec.to(device)
 
@@ -160,70 +161,110 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
 
-def validate(model, dataloader, loss_fn, device):
+def validate(model, dataloader, loss_fn, device, chunk_size=1025, overlap=512, n_fft=2048, hop_length=512):
     model.eval()
     val_loss = 0.0
     sdr_vocals = []
     sdr_instrumentals = []
 
+    # Create a Hann window
+    window = torch.hann_window(n_fft).to(device)
+
     with torch.no_grad():
         # Create a tqdm progress bar
         pbar = tqdm(total=len(dataloader), desc="Validation Progress")
 
-        for batch_idx, (mixture_spec, vocals_spec) in enumerate(dataloader):
+        for batch_idx, (mixture_spec, vocals_spec, mixture, vocals) in enumerate(dataloader):
             mixture_spec = mixture_spec.to(device)
             vocals_spec = vocals_spec.to(device)
-            vocals_spec_pred = model(mixture_spec)
-            loss = loss_fn(vocals_spec_pred, vocals_spec)
+
+            # Ensure the last dimension is of size 2 (real and imaginary parts)
+            if mixture_spec.shape[-1] != 2:
+                raise ValueError("The last dimension of mixture_spec must be of size 2 (real and imaginary parts).")
+            if vocals_spec.shape[-1] != 2:
+                raise ValueError("The last dimension of vocals_spec must be of size 2 (real and imaginary parts).")
+
+            # Convert real tensors to complex tensors
+            mixture_spec_complex = torch.view_as_complex(mixture_spec)
+            vocals_spec_complex = torch.view_as_complex(vocals_spec)
+
+            # Compute phase
+            phase = torch.angle(mixture_spec_complex)
+            phase_exp = torch.cos(phase) + 1j * torch.sin(phase)
+
+            # Initialize variables for chunk processing
+            total_length = mixture_spec.shape[3]  # Spectrogram length is the last dimension
+            num_chunks = (total_length - overlap) // (chunk_size - overlap)
+            vocals_spec_pred_chunks = []
+            instrumentals_spec_pred_chunks = []
+
+            # Process spectrograms in chunks with a sliding window
+            for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
+                chunk_spec = mixture_spec[:, :, :, i:i + chunk_size]
+
+                # Inference on spectrograms
+                vocals_spec_pred_chunk = model(chunk_spec)
+                instrumentals_spec_pred_chunk = chunk_spec - vocals_spec_pred_chunk
+
+                # Collect chunks
+                vocals_spec_pred_chunks.append(vocals_spec_pred_chunk)
+                instrumentals_spec_pred_chunks.append(instrumentals_spec_pred_chunk)
+
+            # Check if chunks were collected
+            if not vocals_spec_pred_chunks:
+                print("No chunks were collected. Skipping this batch.")
+                continue
+
+            # Concatenate chunks
+            vocals_spec_pred = torch.cat(vocals_spec_pred_chunks, dim=3)
+            instrumentals_spec_pred = torch.cat(instrumentals_spec_pred_chunks, dim=3)
+
+            # Ensure the concatenated spectrograms match the original spectrogram length
+            if vocals_spec_pred.shape[3] < total_length:
+                pad_length = total_length - vocals_spec_pred.shape[3]
+                vocals_spec_pred = F.pad(vocals_spec_pred, (0, 0, 0, pad_length))
+                instrumentals_spec_pred = F.pad(instrumentals_spec_pred, (0, 0, 0, pad_length))
+            elif vocals_spec_pred.shape[3] > total_length:
+                vocals_spec_pred = vocals_spec_pred[:, :, :, :total_length]
+                instrumentals_spec_pred = instrumentals_spec_pred[:, :, :, :total_length]
+
+            # Convert predicted spectrograms to complex tensors
+            vocals_spec_pred_complex = torch.complex(vocals_spec_pred[..., 0], vocals_spec_pred[..., 1]) * phase_exp
+            instrumentals_spec_pred_complex = torch.complex(instrumentals_spec_pred[..., 0], instrumentals_spec_pred[..., 1]) * phase_exp
+
+            # Calculate loss on magnitude
+            loss = loss_fn(torch.abs(vocals_spec_pred_complex), torch.abs(vocals_spec_complex))
             val_loss += loss.item()
 
             # Convert tensors to numpy arrays
             mixture_spec_np = mixture_spec.cpu().numpy()
             vocals_spec_np = vocals_spec.cpu().numpy()
             vocals_spec_pred_np = vocals_spec_pred.cpu().numpy()
+            instrumentals_spec_pred_np = instrumentals_spec_pred.cpu().numpy()
 
-            # Compute instrumentals
-            instrumentals_spec_true_np = mixture_spec_np - vocals_spec_np
-            instrumentals_spec_pred_np = mixture_spec_np - vocals_spec_pred_np
+            # Move window to CPU
+            window_cpu = window.cpu()
+
+            # Reconstruct waveforms
+            vocals_pred_np = torch.istft(vocals_spec_pred_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
+            instrumentals_true_np = torch.istft(mixture_spec_complex - vocals_spec_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
+            instrumentals_pred_np = torch.istft(instrumentals_spec_pred_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
 
             # Compute SDR for each sample in the batch
             batch_sdr_vocals = []
             batch_sdr_instrumentals = []
-            for j in range(mixture_spec_np.shape[0]):
-                # For sample j
-                ref_vocals = vocals_spec_np[j]
-                ref_instrumentals = instrumentals_spec_true_np[j]
-                est_vocals = vocals_spec_pred_np[j]
-                est_instrumentals = instrumentals_spec_pred_np[j]
+            for j in range(mixture.shape[0]):
+                ref_vocals = vocals[j].cpu().numpy()
+                ref_instrumentals = instrumentals_true_np[j]
+                est_vocals = vocals_pred_np[j]
+                est_instrumentals = instrumentals_pred_np[j]
 
-                # Detect and ignore silent areas
-                ref_vocals_mask = np.abs(ref_vocals).mean(axis=(0, 1)) > 1e-5
-                ref_instrumentals_mask = np.abs(ref_instrumentals).mean(axis=(0, 1)) > 1e-5
-                est_vocals_mask = np.abs(est_vocals).mean(axis=(0, 1)) > 1e-5
-                est_instrumentals_mask = np.abs(est_instrumentals).mean(axis=(0, 1)) > 1e-5
-
-                # Apply masks to ignore silent areas
-                ref_vocals = ref_vocals[:, :, ref_vocals_mask]
-                ref_instrumentals = ref_instrumentals[:, :, ref_instrumentals_mask]
-                est_vocals = est_vocals[:, :, est_vocals_mask]
-                est_instrumentals = est_instrumentals[:, :, est_instrumentals_mask]
-
-                # Ensure all arrays have the same number of dimensions
-                ref_vocals = ref_vocals[np.newaxis, :, :, :] if ref_vocals.ndim == 2 else ref_vocals
-                ref_instrumentals = ref_instrumentals[np.newaxis, :, :, :] if ref_instrumentals.ndim == 2 else ref_instrumentals
-                est_vocals = est_vocals[np.newaxis, :, :, :] if est_vocals.ndim == 2 else est_vocals
-                est_instrumentals = est_instrumentals[np.newaxis, :, :, :] if est_instrumentals.ndim == 2 else est_instrumentals
-
-                # Stack references and estimates
-                ref = np.vstack([ref_vocals, ref_instrumentals])
-                est = np.vstack([est_vocals, est_instrumentals])
-
-                # Compute BSS eval metrics
-                sdr, _, _, _ = separation.bss_eval_sources(ref, est)
-
-                # Collect SDR for vocals and instrumentals
+                # Compute SDR
+                sdr, _, _, _ = separation.bss_eval_sources(ref_vocals, est_vocals)
                 batch_sdr_vocals.append(sdr[0])
-                batch_sdr_instrumentals.append(sdr[1])
+
+                sdr, _, _, _ = separation.bss_eval_sources(ref_instrumentals, est_instrumentals)
+                batch_sdr_instrumentals.append(sdr[0])
 
             # Update the progress bar with the current batch SDRs
             avg_batch_sdr_vocals = sum(batch_sdr_vocals) / len(batch_sdr_vocals)
@@ -271,13 +312,16 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
     # Define cross-fade length
     cross_fade_length = overlap // 2
 
+    # Create a Hann window
+    window = torch.hann_window(n_fft).to(device)
+
     # Process audio in chunks with a sliding window and cross-fade
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
             chunk = input_audio[:, i:i + chunk_size]
 
             # Convert chunk to spectrogram
-            chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, return_complex=True)
+            chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
             chunk_mag = torch.abs(chunk_spec)
             chunk_phase = torch.angle(chunk_spec)
 
@@ -304,7 +348,7 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
             inst_spec = inst_mag * torch.exp(1j * chunk_phase)
 
             # Convert spectrogram back to waveform
-            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, length=chunk_size, normalized=False, onesided=True, return_complex=False)
+            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
 
             # Cross-fade the overlapping regions
             if i > 0:
@@ -359,13 +403,13 @@ def main():
 
     if args.train:
         # Create training dataset and dataloader
-        train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length)
+        train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
         # Create validation dataset and dataloader if provided
         val_dataloader = None
         if args.val_dir:
-            val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length)
+            val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=None, n_fft=args.n_fft, hop_length=args.hop_length, segment=False)
             val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)  # Always batch size of 1
 
         # Initialize scheduler
