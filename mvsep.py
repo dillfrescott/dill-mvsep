@@ -11,7 +11,7 @@ from prodigyopt import Prodigy
 from mir_eval import separation
 import numpy as np
 
-# Define a simpler CNN model with configurable number of layers
+# Define a simpler CNN model with configurable number of layers for spectrograms
 class SimpleCNN(nn.Module):
     def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=1):
         super(SimpleCNN, self).__init__()
@@ -21,19 +21,19 @@ class SimpleCNN(nn.Module):
         self.dilation_rate = dilation_rate
 
         # First layer
-        self.conv1 = nn.Conv1d(in_channels, hidden_size, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(hidden_size)
+        self.conv1 = nn.Conv2d(in_channels, hidden_size, kernel_size=(3, 3), padding=(1, 1))
+        self.bn1 = nn.BatchNorm2d(hidden_size)
 
         # Intermediate layers with residual connections and dilated convolutions
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
         self.dilation_rates = [dilation_rate ** i for i in range(num_layers - 2)]
         for dilation in self.dilation_rates:
-            self.convs.append(nn.Conv1d(hidden_size, hidden_size, kernel_size=3, padding=dilation, dilation=dilation))
-            self.bns.append(nn.BatchNorm1d(hidden_size))
+            self.convs.append(nn.Conv2d(hidden_size, hidden_size, kernel_size=(3, 3), padding=(dilation, dilation), dilation=(dilation, dilation)))
+            self.bns.append(nn.BatchNorm2d(hidden_size))
 
         # Last layer
-        self.conv_last = nn.Conv1d(hidden_size, in_channels, kernel_size=3, padding=1)
+        self.conv_last = nn.Conv2d(hidden_size, in_channels, kernel_size=(3, 3), padding=(1, 1))
 
     def forward(self, x):
         # First layer
@@ -50,12 +50,14 @@ class SimpleCNN(nn.Module):
 
         return x
 
-# Custom Dataset class with normalization
+# Custom Dataset class with normalization and spectrogram conversion
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=264600):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=2048, hop_length=512):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
+        self.n_fft = n_fft
+        self.hop_length = hop_length
         self.tracks = [os.path.join(root_dir, track) for track in os.listdir(root_dir)]
 
     def __len__(self):
@@ -75,28 +77,29 @@ class MUSDBDataset(Dataset):
         mixture = mixture[:, :min_length]
         vocals = vocals[:, :min_length]
 
+        # Convert to spectrograms
+        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=True)
+        vocals_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=True)
+
+        # Convert to magnitude spectrograms
+        mixture_spec = torch.abs(mixture_spec)
+        vocals_spec = torch.abs(vocals_spec)
+
         # Normalize to zero mean and unit variance
-        mixture = (mixture - mixture.mean(dim=1, keepdim=True)) / (mixture.std(dim=1, keepdim=True) + 1e-8)
-        vocals = (vocals - vocals.mean(dim=1, keepdim=True)) / (vocals.std(dim=1, keepdim=True) + 1e-8)
-
-        # Define a scaling factor to reduce the volume (e.g., 0.5 for half the volume)
-        scaling_factor = 0.05
-
-        # Apply the scaling factor to make the audio quieter
-        mixture_quiet = mixture * scaling_factor
-        vocals_quiet = vocals * scaling_factor
+        mixture_spec = (mixture_spec - mixture_spec.mean(dim=(1, 2), keepdim=True)) / (mixture_spec.std(dim=(1, 2), keepdim=True) + 1e-8)
+        vocals_spec = (vocals_spec - vocals_spec.mean(dim=(1, 2), keepdim=True)) / (vocals_spec.std(dim=(1, 2), keepdim=True) + 1e-8)
 
         # Optionally segment the signals
         if self.segment_length:
-            if mixture.shape[1] >= self.segment_length:
-                start = torch.randint(0, mixture.shape[1] - self.segment_length, (1,))
-                mixture = mixture[:, start:start+self.segment_length]
-                vocals = vocals[:, start:start+self.segment_length]
+            if mixture_spec.shape[2] >= self.segment_length // self.hop_length:
+                start = torch.randint(0, mixture_spec.shape[2] - self.segment_length // self.hop_length, (1,))
+                mixture_spec = mixture_spec[:, :, start:start + self.segment_length // self.hop_length]
+                vocals_spec = vocals_spec[:, :, start:start + self.segment_length // self.hop_length]
             else:
-                mixture = F.pad(mixture, (0, self.segment_length - mixture.shape[1]))
-                vocals = F.pad(vocals, (0, self.segment_length - vocals.shape[1]))
+                mixture_spec = F.pad(mixture_spec, (0, self.segment_length // self.hop_length - mixture_spec.shape[2]))
+                vocals_spec = F.pad(vocals_spec, (0, self.segment_length // self.hop_length - vocals_spec.shape[2]))
 
-        return mixture, vocals
+        return mixture_spec, vocals_spec
 
 # Training function with loss logging
 def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, checkpoint_steps,
@@ -118,13 +121,13 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
 
     model.train()
     for epoch in range(epochs):
-        for mixture, vocals in dataloader:
-            mixture = mixture.to(device)
-            vocals = vocals.to(device)
+        for mixture_spec, vocals_spec in dataloader:
+            mixture_spec = mixture_spec.to(device)
+            vocals_spec = vocals_spec.to(device)
 
             optimizer.zero_grad()
-            vocals_pred = model(mixture)
-            loss = loss_fn(vocals_pred, vocals)
+            vocals_spec_pred = model(mixture_spec)
+            loss = loss_fn(vocals_spec_pred, vocals_spec)
             loss.backward()
             optimizer.step()
             scheduler.step()  # Step the scheduler
@@ -167,49 +170,49 @@ def validate(model, dataloader, loss_fn, device):
         # Create a tqdm progress bar
         pbar = tqdm(total=len(dataloader), desc="Validation Progress")
 
-        for batch_idx, (mixture, vocals) in enumerate(dataloader):
-            mixture = mixture.to(device)
-            vocals = vocals.to(device)
-            vocals_pred = model(mixture)
-            loss = loss_fn(vocals_pred, vocals)
+        for batch_idx, (mixture_spec, vocals_spec) in enumerate(dataloader):
+            mixture_spec = mixture_spec.to(device)
+            vocals_spec = vocals_spec.to(device)
+            vocals_spec_pred = model(mixture_spec)
+            loss = loss_fn(vocals_spec_pred, vocals_spec)
             val_loss += loss.item()
 
             # Convert tensors to numpy arrays
-            mixture_np = mixture.cpu().numpy()
-            vocals_np = vocals.cpu().numpy()
-            vocals_pred_np = vocals_pred.cpu().numpy()
+            mixture_spec_np = mixture_spec.cpu().numpy()
+            vocals_spec_np = vocals_spec.cpu().numpy()
+            vocals_spec_pred_np = vocals_spec_pred.cpu().numpy()
 
             # Compute instrumentals
-            instrumentals_true_np = mixture_np - vocals_np
-            instrumentals_pred_np = mixture_np - vocals_pred_np
+            instrumentals_spec_true_np = mixture_spec_np - vocals_spec_np
+            instrumentals_spec_pred_np = mixture_spec_np - vocals_spec_pred_np
 
             # Compute SDR for each sample in the batch
             batch_sdr_vocals = []
             batch_sdr_instrumentals = []
-            for j in range(mixture_np.shape[0]):
+            for j in range(mixture_spec_np.shape[0]):
                 # For sample j
-                ref_vocals = vocals_np[j]
-                ref_instrumentals = instrumentals_true_np[j]
-                est_vocals = vocals_pred_np[j]
-                est_instrumentals = instrumentals_pred_np[j]
+                ref_vocals = vocals_spec_np[j]
+                ref_instrumentals = instrumentals_spec_true_np[j]
+                est_vocals = vocals_spec_pred_np[j]
+                est_instrumentals = instrumentals_spec_pred_np[j]
 
                 # Detect and ignore silent areas
-                ref_vocals_mask = np.abs(ref_vocals).mean(axis=0) > 1e-5
-                ref_instrumentals_mask = np.abs(ref_instrumentals).mean(axis=0) > 1e-5
-                est_vocals_mask = np.abs(est_vocals).mean(axis=0) > 1e-5
-                est_instrumentals_mask = np.abs(est_instrumentals).mean(axis=0) > 1e-5
+                ref_vocals_mask = np.abs(ref_vocals).mean(axis=(0, 1)) > 1e-5
+                ref_instrumentals_mask = np.abs(ref_instrumentals).mean(axis=(0, 1)) > 1e-5
+                est_vocals_mask = np.abs(est_vocals).mean(axis=(0, 1)) > 1e-5
+                est_instrumentals_mask = np.abs(est_instrumentals).mean(axis=(0, 1)) > 1e-5
 
                 # Apply masks to ignore silent areas
-                ref_vocals = ref_vocals[:, ref_vocals_mask]
-                ref_instrumentals = ref_instrumentals[:, ref_instrumentals_mask]
-                est_vocals = est_vocals[:, est_vocals_mask]
-                est_instrumentals = est_instrumentals[:, est_instrumentals_mask]
+                ref_vocals = ref_vocals[:, :, ref_vocals_mask]
+                ref_instrumentals = ref_instrumentals[:, :, ref_instrumentals_mask]
+                est_vocals = est_vocals[:, :, est_vocals_mask]
+                est_instrumentals = est_instrumentals[:, :, est_instrumentals_mask]
 
                 # Ensure all arrays have the same number of dimensions
-                ref_vocals = ref_vocals[np.newaxis, :, :] if ref_vocals.ndim == 1 else ref_vocals
-                ref_instrumentals = ref_instrumentals[np.newaxis, :, :] if ref_instrumentals.ndim == 1 else ref_instrumentals
-                est_vocals = est_vocals[np.newaxis, :, :] if est_vocals.ndim == 1 else est_vocals
-                est_instrumentals = est_instrumentals[np.newaxis, :, :] if est_instrumentals.ndim == 1 else est_instrumentals
+                ref_vocals = ref_vocals[np.newaxis, :, :, :] if ref_vocals.ndim == 2 else ref_vocals
+                ref_instrumentals = ref_instrumentals[np.newaxis, :, :, :] if ref_instrumentals.ndim == 2 else ref_instrumentals
+                est_vocals = est_vocals[np.newaxis, :, :, :] if est_vocals.ndim == 2 else est_vocals
+                est_instrumentals = est_instrumentals[np.newaxis, :, :, :] if est_instrumentals.ndim == 2 else est_instrumentals
 
                 # Stack references and estimates
                 ref = np.vstack([ref_vocals, ref_instrumentals])
@@ -247,7 +250,7 @@ def validate(model, dataloader, loss_fn, device):
     return avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
-              chunk_size=16384, overlap=4096, device='cpu'):
+              chunk_size=16384, overlap=4096, device='cpu', n_fft=2048, hop_length=512):
     # Load model weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
@@ -260,15 +263,10 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
         raise ValueError("Input audio must have 2 channels.")
     input_audio = input_audio.to(device)
 
-    # Normalize input audio
-    input_audio_mean = input_audio.mean(dim=1, keepdim=True)
-    input_audio_std = input_audio.std(dim=1, keepdim=True)
-    input_audio_normalized = (input_audio - input_audio_mean) / (input_audio_std + 1e-8)
-
     # Initialize variables for chunk processing
-    total_length = input_audio_normalized.shape[1]
+    total_length = input_audio.shape[1]
     num_chunks = (total_length - overlap) // (chunk_size - overlap)
-    instrumentals = torch.zeros_like(input_audio_normalized)
+    instrumentals = torch.zeros_like(input_audio)
 
     # Define cross-fade length
     cross_fade_length = overlap // 2
@@ -276,16 +274,34 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
     # Process audio in chunks with a sliding window and cross-fade
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
         for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
-            chunk = input_audio_normalized[:, i:i + chunk_size]
-            chunk = chunk.unsqueeze(0)  # Add batch dimension
+            chunk = input_audio[:, i:i + chunk_size]
+
+            # Convert chunk to spectrogram
+            chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, return_complex=True)
+            chunk_spec = torch.abs(chunk_spec)
+
+            # Normalize chunk spectrogram
+            chunk_spec_mean = chunk_spec.mean(dim=(1, 2), keepdim=True)
+            chunk_spec_std = chunk_spec.std(dim=(1, 2), keepdim=True)
+            chunk_spec_normalized = (chunk_spec - chunk_spec_mean) / (chunk_spec_std + 1e-8)
+
+            # Add batch dimension
+            chunk_spec_normalized = chunk_spec_normalized.unsqueeze(0)
 
             # Inference
             with torch.no_grad():
-                vocals_pred = model(chunk)
-                inst_chunk = chunk - vocals_pred
+                vocals_spec_pred = model(chunk_spec_normalized)
+                inst_spec = chunk_spec_normalized - vocals_spec_pred
 
             # Remove batch dimension
-            inst_chunk = inst_chunk.squeeze(0)
+            inst_spec = inst_spec.squeeze(0)
+
+            # Denormalize the output
+            inst_spec = inst_spec * chunk_spec_std + chunk_spec_mean
+
+            # Convert spectrogram back to waveform
+            inst_spec = torch.complex(inst_spec, torch.zeros_like(inst_spec))
+            inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, length=chunk_size)
 
             # Cross-fade the overlapping regions
             if i > 0:
@@ -305,9 +321,6 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
             instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
 
             pbar.update(1)
-
-    # Denormalize the output
-    instrumentals = instrumentals * input_audio_std + input_audio_mean
 
     # Apply clipping to avoid extreme values
     instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
@@ -330,24 +343,26 @@ def main():
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
     parser.add_argument('--num_layers', type=int, default=8, help='Number of layers in the CNN model')
+    parser.add_argument('--n_fft', type=int, default=2048, help='Number of FFT bins for STFT')
+    parser.add_argument('--hop_length', type=int, default=512, help='Hop length for STFT')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+    model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
     if args.train:
         # Create training dataset and dataloader
-        train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length)
+        train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length)
         train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
 
         # Create validation dataset and dataloader if provided
         val_dataloader = None
         if args.val_dir:
-            val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=args.segment_length)
+            val_dataset = MUSDBDataset(root_dir=args.val_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length)
             val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=0)  # Always batch size of 1
 
         # Initialize scheduler
@@ -362,9 +377,9 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+        model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
         # Run inference
-        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device)
+        inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
         print("Please specify either --train or --infer")
 
