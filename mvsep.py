@@ -13,7 +13,7 @@ import numpy as np
 
 # Define a simpler CNN model with configurable number of layers
 class SimpleCNN(nn.Module):
-    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=2):
+    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=1):
         super(SimpleCNN, self).__init__()
         self.in_channels = in_channels
         self.hidden_size = hidden_size
@@ -21,7 +21,7 @@ class SimpleCNN(nn.Module):
         self.dilation_rate = dilation_rate
 
         # First layer
-        self.conv1 = nn.Conv1d(in_channels, hidden_size, kernel_size=5, padding=1)
+        self.conv1 = nn.Conv1d(in_channels, hidden_size, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm1d(hidden_size)
 
         # Intermediate layers with residual connections and dilated convolutions
@@ -33,19 +33,7 @@ class SimpleCNN(nn.Module):
             self.bns.append(nn.BatchNorm1d(hidden_size))
 
         # Last layer
-        self.conv_last = nn.Conv1d(hidden_size, in_channels, kernel_size=5, padding=3)
-
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
-            nn.ReLU(),
-            nn.Conv1d(hidden_size, hidden_size, kernel_size=1),
-            nn.Sigmoid()
-        )
-
-        # Upsampling and downsampling
-        self.upsample = nn.Upsample(scale_factor=2, mode='nearest')
-        self.downsample = nn.AvgPool1d(kernel_size=2)
+        self.conv_last = nn.Conv1d(hidden_size, in_channels, kernel_size=3, padding=1)
 
     def forward(self, x):
         # First layer
@@ -57,14 +45,6 @@ class SimpleCNN(nn.Module):
             x = F.relu(bn(conv(x)))
             x = x + residual  # Residual connection
 
-        # Attention mechanism
-        attn = self.attention(x)
-        x = x * attn
-
-        # Upsampling and downsampling
-        x = self.upsample(x)
-        x = self.downsample(x)
-
         # Last layer
         x = self.conv_last(x)
 
@@ -72,7 +52,7 @@ class SimpleCNN(nn.Module):
 
 # Custom Dataset class with normalization
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=8192):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=264600):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
@@ -98,6 +78,13 @@ class MUSDBDataset(Dataset):
         # Normalize to zero mean and unit variance
         mixture = (mixture - mixture.mean(dim=1, keepdim=True)) / (mixture.std(dim=1, keepdim=True) + 1e-8)
         vocals = (vocals - vocals.mean(dim=1, keepdim=True)) / (vocals.std(dim=1, keepdim=True) + 1e-8)
+
+        # Define a scaling factor to reduce the volume (e.g., 0.5 for half the volume)
+        scaling_factor = 0.05
+
+        # Apply the scaling factor to make the audio quieter
+        mixture_quiet = mixture * scaling_factor
+        vocals_quiet = vocals * scaling_factor
 
         # Optionally segment the signals
         if self.segment_length:
@@ -260,12 +247,9 @@ def validate(model, dataloader, loss_fn, device):
     return avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
-              chunk_size=16384, device='cpu'):
+              chunk_size=16384, overlap=4096, device='cpu'):
     # Load model weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    print("Checkpoint keys:", checkpoint.keys())  # Debug print
-
-    # Load state dictionary with strict=False to ignore missing keys
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
     model.eval()
     model.to(device)
@@ -276,19 +260,23 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
         raise ValueError("Input audio must have 2 channels.")
     input_audio = input_audio.to(device)
 
-    # Normalize the input audio
-    input_max = input_audio.abs().max()
-    mixture = input_audio / input_max
+    # Normalize input audio
+    input_audio_mean = input_audio.mean(dim=1, keepdim=True)
+    input_audio_std = input_audio.std(dim=1, keepdim=True)
+    input_audio_normalized = (input_audio - input_audio_mean) / (input_audio_std + 1e-8)
 
     # Initialize variables for chunk processing
-    total_length = mixture.shape[1]
-    num_chunks = (total_length + chunk_size - 1) // chunk_size  # Ceiling division
-    instrumentals = torch.zeros_like(mixture)
+    total_length = input_audio_normalized.shape[1]
+    num_chunks = (total_length - overlap) // (chunk_size - overlap)
+    instrumentals = torch.zeros_like(input_audio_normalized)
 
-    # Process audio in chunks with a progress bar
+    # Define cross-fade length
+    cross_fade_length = overlap // 2
+
+    # Process audio in chunks with a sliding window and cross-fade
     with tqdm(total=num_chunks, desc="Processing audio") as pbar:
-        for i in range(0, total_length, chunk_size):
-            chunk = mixture[:, i:i + chunk_size]
+        for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
+            chunk = input_audio_normalized[:, i:i + chunk_size]
             chunk = chunk.unsqueeze(0)  # Add batch dimension
 
             # Inference
@@ -296,17 +284,33 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
                 vocals_pred = model(chunk)
                 inst_chunk = chunk - vocals_pred
 
-            # Denormalize instrumentals
-            inst_chunk *= input_max
-
             # Remove batch dimension
             inst_chunk = inst_chunk.squeeze(0)
 
-            # Place the chunk in the final instrumentals tensor
-            end = i + chunk.shape[2]
-            instrumentals[:, i:end] = inst_chunk
+            # Cross-fade the overlapping regions
+            if i > 0:
+                fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
+                fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
+
+                # Apply fade-in to the new chunk
+                inst_chunk[:, :cross_fade_length] *= fade_in
+
+                # Apply fade-out to the previous chunk
+                instrumentals[:, i:i + cross_fade_length] *= fade_out
+
+                # Add the cross-faded regions
+                instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
+
+            # Place the non-overlapping part of the chunk in the final instrumentals tensor
+            instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
 
             pbar.update(1)
+
+    # Denormalize the output
+    instrumentals = instrumentals * input_audio_std + input_audio_mean
+
+    # Apply clipping to avoid extreme values
+    instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
 
     # Save the separated instrumentals
     torchaudio.save(output_instrumentals_path, instrumentals.cpu(), sr)
@@ -318,20 +322,20 @@ def main():
     parser.add_argument('--data_dir', type=str, default='path/to/musdb18', help='Path to MUSDB18 training dataset')
     parser.add_argument('--val_dir', type=str, default=None, help='Path to MUSDB18 validation dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate')
     parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
-    parser.add_argument('--segment_length', type=int, default=8192, help='Segment length for training')
+    parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
     parser.add_argument('--num_layers', type=int, default=8, help='Number of layers in the CNN model')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=2048, num_layers=args.num_layers)
+    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -358,7 +362,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=2048, num_layers=args.num_layers)
+        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device)
     else:
