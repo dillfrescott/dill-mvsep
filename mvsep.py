@@ -79,12 +79,16 @@ class MUSDBDataset(Dataset):
         vocals = vocals[:, :min_length]
 
         # Convert to spectrograms
-        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=True)
-        vocals_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=True)
+        mixture_spec = torch.stft(mixture, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=False)
+        vocals_spec = torch.stft(vocals, n_fft=self.n_fft, hop_length=self.hop_length, return_complex=False)
+
+        # Ensure the last dimension is of size 2 (real and imaginary parts)
+        if mixture_spec.shape[-1] != 2 or vocals_spec.shape[-1] != 2:
+            raise ValueError("The last dimension of spectrograms must be of size 2 (real and imaginary parts).")
 
         # Convert to magnitude spectrograms
-        mixture_spec = torch.abs(mixture_spec)
-        vocals_spec = torch.abs(vocals_spec)
+        mixture_spec = torch.abs(torch.view_as_complex(mixture_spec))
+        vocals_spec = torch.abs(torch.view_as_complex(vocals_spec))
 
         # Normalize to zero mean and unit variance
         mixture_spec = (mixture_spec - mixture_spec.mean(dim=(1, 2), keepdim=True)) / (mixture_spec.std(dim=(1, 2), keepdim=True) + 1e-8)
@@ -140,11 +144,22 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             desc = f"Epoch {epoch+1}/{epochs} - Loss: {loss.item():.4f} - Avg Loss: {avg_loss:.4f}"
 
             if step % checkpoint_steps == 0:
+                # Save checkpoint before validation
+                torch.save({
+                    'step': step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'avg_loss': avg_loss,
+                    'loss_log': loss_log
+                }, f"checkpoint_step_{step}.pt")
+
                 if val_dataloader:
                     avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals = validate(model, val_dataloader, loss_fn, device)
                     desc += f" - Val Loss: {avg_val_loss:.4f}, SDR Vocals: {avg_sdr_vocals:.4f}, SDR Instrumentals: {avg_sdr_instrumentals:.4f}"
                 else:
                     avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals = None, None, None
+
+                # Save checkpoint after validation
                 torch.save({
                     'step': step,
                     'model_state_dict': model.state_dict(),
@@ -155,15 +170,15 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
                     'sdr_instrumentals': avg_sdr_instrumentals,
                     'loss_log': loss_log
                 }, f"checkpoint_step_{step}.pt")
+
             progress_bar.set_description(desc)
 
     # Save final loss log
     torch.save({'loss_log': loss_log}, 'loss_log.pt')
     progress_bar.close()
 
-def validate(model, dataloader, loss_fn, device, chunk_size=1025, overlap=512, n_fft=2048, hop_length=512):
+def validate(model, dataloader, loss_fn, device, chunk_size=16384, overlap=4096, n_fft=2048, hop_length=512):
     model.eval()
-    val_loss = 0.0
     sdr_vocals = []
     sdr_instrumentals = []
 
@@ -174,90 +189,86 @@ def validate(model, dataloader, loss_fn, device, chunk_size=1025, overlap=512, n
         # Create a tqdm progress bar
         pbar = tqdm(total=len(dataloader), desc="Validation Progress")
 
-        for batch_idx, (mixture_spec, vocals_spec, mixture, vocals) in enumerate(dataloader):
-            mixture_spec = mixture_spec.to(device)
-            vocals_spec = vocals_spec.to(device)
-
-            # Ensure the last dimension is of size 2 (real and imaginary parts)
-            if mixture_spec.shape[-1] != 2:
-                raise ValueError("The last dimension of mixture_spec must be of size 2 (real and imaginary parts).")
-            if vocals_spec.shape[-1] != 2:
-                raise ValueError("The last dimension of vocals_spec must be of size 2 (real and imaginary parts).")
-
-            # Convert real tensors to complex tensors
-            mixture_spec_complex = torch.view_as_complex(mixture_spec)
-            vocals_spec_complex = torch.view_as_complex(vocals_spec)
-
-            # Compute phase
-            phase = torch.angle(mixture_spec_complex)
-            phase_exp = torch.cos(phase) + 1j * torch.sin(phase)
+        for batch_idx, (mixture, vocals, _, _) in enumerate(dataloader):
+            mixture = mixture.to(device)
+            vocals = vocals.to(device)
 
             # Initialize variables for chunk processing
-            total_length = mixture_spec.shape[3]  # Spectrogram length is the last dimension
+            total_length = mixture.shape[1]
             num_chunks = (total_length - overlap) // (chunk_size - overlap)
-            vocals_spec_pred_chunks = []
-            instrumentals_spec_pred_chunks = []
+            instrumentals = torch.zeros_like(mixture)
 
-            # Process spectrograms in chunks with a sliding window
+            # Define cross-fade length
+            cross_fade_length = overlap // 2
+
+            # Process audio in chunks with a sliding window and cross-fade
             for i in range(0, total_length - chunk_size + 1, chunk_size - overlap):
-                chunk_spec = mixture_spec[:, :, :, i:i + chunk_size]
+                chunk = mixture[:, i:i + chunk_size]
 
-                # Inference on spectrograms
-                vocals_spec_pred_chunk = model(chunk_spec)
-                instrumentals_spec_pred_chunk = chunk_spec - vocals_spec_pred_chunk
+                # Convert chunk to spectrogram
+                chunk_spec = torch.stft(chunk, n_fft=n_fft, hop_length=hop_length, window=window, return_complex=True)
+                chunk_mag = torch.abs(chunk_spec)
+                chunk_phase = torch.angle(chunk_spec)
 
-                # Collect chunks
-                vocals_spec_pred_chunks.append(vocals_spec_pred_chunk)
-                instrumentals_spec_pred_chunks.append(instrumentals_spec_pred_chunk)
+                # Normalize chunk magnitude spectrogram
+                chunk_mag_mean = chunk_mag.mean(dim=(1, 2), keepdim=True)
+                chunk_mag_std = chunk_mag.std(dim=(1, 2), keepdim=True)
+                chunk_mag_normalized = (chunk_mag - chunk_mag_mean) / (chunk_mag_std + 1e-8)
 
-            # Check if chunks were collected
-            if not vocals_spec_pred_chunks:
-                print("No chunks were collected. Skipping this batch.")
-                continue
+                # Add batch dimension
+                chunk_mag_normalized = chunk_mag_normalized.unsqueeze(0)
 
-            # Concatenate chunks
-            vocals_spec_pred = torch.cat(vocals_spec_pred_chunks, dim=3)
-            instrumentals_spec_pred = torch.cat(instrumentals_spec_pred_chunks, dim=3)
+                # Inference
+                with torch.no_grad():
+                    inst_mag = model(chunk_mag_normalized)
 
-            # Ensure the concatenated spectrograms match the original spectrogram length
-            if vocals_spec_pred.shape[3] < total_length:
-                pad_length = total_length - vocals_spec_pred.shape[3]
-                vocals_spec_pred = F.pad(vocals_spec_pred, (0, 0, 0, pad_length))
-                instrumentals_spec_pred = F.pad(instrumentals_spec_pred, (0, 0, 0, pad_length))
-            elif vocals_spec_pred.shape[3] > total_length:
-                vocals_spec_pred = vocals_spec_pred[:, :, :, :total_length]
-                instrumentals_spec_pred = instrumentals_spec_pred[:, :, :, :total_length]
+                # Remove batch dimension
+                inst_mag = inst_mag.squeeze(0)
 
-            # Convert predicted spectrograms to complex tensors
-            vocals_spec_pred_complex = torch.complex(vocals_spec_pred[..., 0], vocals_spec_pred[..., 1]) * phase_exp
-            instrumentals_spec_pred_complex = torch.complex(instrumentals_spec_pred[..., 0], instrumentals_spec_pred[..., 1]) * phase_exp
+                # Denormalize the output
+                inst_mag = inst_mag * chunk_mag_std + chunk_mag_mean
 
-            # Calculate loss on magnitude
-            loss = loss_fn(torch.abs(vocals_spec_pred_complex), torch.abs(vocals_spec_complex))
-            val_loss += loss.item()
+                # Reconstruct the complex spectrogram
+                inst_spec = inst_mag * torch.exp(1j * chunk_phase)
 
-            # Convert tensors to numpy arrays
-            mixture_spec_np = mixture_spec.cpu().numpy()
-            vocals_spec_np = vocals_spec.cpu().numpy()
-            vocals_spec_pred_np = vocals_spec_pred.cpu().numpy()
-            instrumentals_spec_pred_np = instrumentals_spec_pred.cpu().numpy()
+                # Convert spectrogram back to waveform
+                inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
 
-            # Move window to CPU
-            window_cpu = window.cpu()
+                # Cross-fade the overlapping regions
+                if i > 0:
+                    fade_in = torch.linspace(0, 1, cross_fade_length).to(device)
+                    fade_out = torch.linspace(1, 0, cross_fade_length).to(device)
 
-            # Reconstruct waveforms
-            vocals_pred_np = torch.istft(vocals_spec_pred_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
-            instrumentals_true_np = torch.istft(mixture_spec_complex - vocals_spec_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
-            instrumentals_pred_np = torch.istft(instrumentals_spec_pred_complex, n_fft=n_fft, hop_length=hop_length, window=window_cpu, length=mixture.shape[2]).numpy()
+                    # Apply fade-in to the new chunk
+                    inst_chunk[:, :cross_fade_length] *= fade_in
 
-            # Compute SDR for each sample in the batch
+                    # Apply fade-out to the previous chunk
+                    instrumentals[:, i:i + cross_fade_length] *= fade_out
+
+                    # Add the cross-faded regions
+                    instrumentals[:, i:i + cross_fade_length] += inst_chunk[:, :cross_fade_length]
+
+                # Place the non-overlapping part of the chunk in the final instrumentals tensor
+                instrumentals[:, i + cross_fade_length:i + chunk_size] = inst_chunk[:, cross_fade_length:]
+
+            # Apply clipping to avoid extreme values
+            instrumentals = torch.clamp(instrumentals, -1.0, 1.0)
+
+            # Calculate SDR for each sample in the batch
             batch_sdr_vocals = []
             batch_sdr_instrumentals = []
             for j in range(mixture.shape[0]):
                 ref_vocals = vocals[j].cpu().numpy()
-                ref_instrumentals = instrumentals_true_np[j]
-                est_vocals = vocals_pred_np[j]
-                est_instrumentals = instrumentals_pred_np[j]
+                ref_instrumentals = mixture[j].cpu().numpy() - ref_vocals
+                est_instrumentals = instrumentals[j].cpu().numpy()
+
+                # Invert the phase to get the vocal part
+                est_vocals = mixture[j].cpu().numpy() - est_instrumentals
+
+                # Check if estimated sources are all zeros
+                if np.all(est_vocals == 0) or np.all(est_instrumentals == 0):
+                    print(f"Warning: Estimated source is all zeros for batch {batch_idx}, sample {j}. Skipping SDR calculation.")
+                    continue
 
                 # Compute SDR
                 sdr, _, _, _ = separation.bss_eval_sources(ref_vocals, est_vocals)
@@ -267,12 +278,13 @@ def validate(model, dataloader, loss_fn, device, chunk_size=1025, overlap=512, n
                 batch_sdr_instrumentals.append(sdr[0])
 
             # Update the progress bar with the current batch SDRs
-            avg_batch_sdr_vocals = sum(batch_sdr_vocals) / len(batch_sdr_vocals)
-            avg_batch_sdr_instrumentals = sum(batch_sdr_instrumentals) / len(batch_sdr_instrumentals)
-            pbar.set_postfix({
-                "SDR (Vocals)": f"{avg_batch_sdr_vocals:.4f}",
-                "SDR (Instrumentals)": f"{avg_batch_sdr_instrumentals:.4f}"
-            })
+            if batch_sdr_vocals and batch_sdr_instrumentals:
+                avg_batch_sdr_vocals = sum(batch_sdr_vocals) / len(batch_sdr_vocals)
+                avg_batch_sdr_instrumentals = sum(batch_sdr_instrumentals) / len(batch_sdr_instrumentals)
+                pbar.set_postfix({
+                    "SDR (Vocals)": f"{avg_batch_sdr_vocals:.4f}",
+                    "SDR (Instrumentals)": f"{avg_batch_sdr_instrumentals:.4f}"
+                })
             pbar.update(1)
 
             # Append batch SDRs to the overall SDR lists
@@ -282,13 +294,11 @@ def validate(model, dataloader, loss_fn, device, chunk_size=1025, overlap=512, n
         pbar.close()
 
     model.train()
-    avg_val_loss = val_loss / len(dataloader)
-    avg_sdr_vocals = sum(sdr_vocals) / len(sdr_vocals)
-    avg_sdr_instrumentals = sum(sdr_instrumentals) / len(sdr_instrumentals)
-    print(f"Validation - Avg Loss: {avg_val_loss:.4f}")
-    print(f"Avg SDR (Vocals): {avg_sdr_vocals:.4f}")
-    print(f"Avg SDR (Instrumentals): {avg_sdr_instrumentals:.4f}")
-    return avg_val_loss, avg_sdr_vocals, avg_sdr_instrumentals
+    avg_sdr_vocals = sum(sdr_vocals) / len(sdr_vocals) if sdr_vocals else 0.0
+    avg_sdr_instrumentals = sum(sdr_instrumentals) / len(sdr_instrumentals) if sdr_instrumentals else 0.0
+    print(f"Validation - Avg SDR (Vocals): {avg_sdr_vocals:.4f}")
+    print(f"Validation - Avg SDR (Instrumentals): {avg_sdr_instrumentals:.4f}")
+    return avg_sdr_vocals, avg_sdr_instrumentals
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
               chunk_size=16384, overlap=4096, device='cpu', n_fft=2048, hop_length=512):
