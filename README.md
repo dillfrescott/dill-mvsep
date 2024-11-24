@@ -1,1 +1,1 @@
-## Highly experimental. Heavy work in progress.
+## Highly experimental and probably does not work well or at all.
