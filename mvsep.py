@@ -257,15 +257,15 @@ def main():
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
-    parser.add_argument('--num_layers', type=int, default=12, help='Number of layers in the CNN model')
-    parser.add_argument('--n_fft', type=int, default=2048, help='Number of FFT bins for STFT')
-    parser.add_argument('--hop_length', type=int, default=512, help='Hop length for STFT')
+    parser.add_argument('--num_layers', type=int, default=6, help='Number of layers in the CNN model')
+    parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
+    parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
+    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -286,7 +286,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
+        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
