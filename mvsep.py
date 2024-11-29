@@ -67,7 +67,7 @@ class MUSDBDataset(Dataset):
 
     def __getitem__(self, idx):
         track_path = self.tracks[idx]
-        mixture, _ = torchaudio.load(os.path.join(track_path, 'mixture.wav'))
+        mixture, _ = torchaudio.load(os.path.join(track_path, 'other.wav'))
         vocals, _ = torchaudio.load(os.path.join(track_path, 'vocals.wav'))
 
         # Ensure both signals have the same number of channels
@@ -250,14 +250,14 @@ def main():
     parser.add_argument('--infer', action='store_true', help='Inference mode')
     parser.add_argument('--data_dir', type=str, default='path/to/musdb18', help='Path to MUSDB18 training dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
-    parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
+    parser.add_argument('--batch_size', type=int, default=2, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate')
     parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
     parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
-    parser.add_argument('--num_layers', type=int, default=6, help='Number of layers in the CNN model')
+    parser.add_argument('--num_layers', type=int, default=4, help='Number of layers in the CNN model')
     parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
     args = parser.parse_args()
@@ -265,7 +265,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # Initialize model, optimizer, and loss function
-    model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+    model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
     loss_fn = nn.MSELoss()
 
@@ -286,7 +286,7 @@ def main():
             print("Please specify an input WAV file for inference using --input_wav")
             return
         # Ensure the model architecture matches the one used during training
-        model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
+        model = SimpleCNN(in_channels=2, hidden_size=256, num_layers=args.num_layers)
         # Run inference
         inference(model, args.checkpoint_path, args.input_wav, args.output_instrumental, device=device, n_fft=args.n_fft, hop_length=args.hop_length)
     else:
