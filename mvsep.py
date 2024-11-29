@@ -52,7 +52,7 @@ class SimpleCNN(nn.Module):
 
 # Custom Dataset class with normalization and spectrogram conversion
 class MUSDBDataset(Dataset):
-    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=2048, hop_length=512, segment=True):
+    def __init__(self, root_dir, sample_rate=44100, segment_length=264600, n_fft=4096, hop_length=1024, segment=True):
         self.root_dir = root_dir
         self.sample_rate = sample_rate
         self.segment_length = segment_length
@@ -160,7 +160,7 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     progress_bar.close()
 
 def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
-              chunk_size=16384, overlap=4096, device='cpu', n_fft=2048, hop_length=512):
+              chunk_size=16384, overlap=4096, device='cpu', n_fft=4096, hop_length=1024):
     # Load model weights
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'], strict=False)
