@@ -6,6 +6,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 from prodigyopt import Prodigy
 from mir_eval import separation
@@ -13,7 +14,7 @@ import numpy as np
 
 # Define a simpler CNN model with configurable number of layers for spectrograms
 class SimpleCNN(nn.Module):
-    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=1):
+    def __init__(self, in_channels=2, hidden_size=512, num_layers=5, dilation_rate=2):
         super(SimpleCNN, self).__init__()
         self.in_channels = in_channels
         self.hidden_size = hidden_size
@@ -24,31 +25,71 @@ class SimpleCNN(nn.Module):
         self.conv1 = nn.Conv2d(in_channels, hidden_size, kernel_size=(3, 3), padding=(1, 1))
         self.bn1 = nn.BatchNorm2d(hidden_size)
 
-        # Intermediate layers with residual connections and dilated convolutions
+        # Intermediate layers with residual connections, dilated convolutions, and attention
         self.convs = nn.ModuleList()
         self.bns = nn.ModuleList()
+        self.attentions = nn.ModuleList()  # Attention mechanisms
         self.dilation_rates = [dilation_rate ** i for i in range(num_layers - 2)]
         for dilation in self.dilation_rates:
-            self.convs.append(nn.Conv2d(hidden_size, hidden_size, kernel_size=(3, 3), padding=(dilation, dilation), dilation=(dilation, dilation)))
+            # Dilated convolution
+            self.convs.append(
+                nn.Conv2d(
+                    hidden_size, hidden_size, kernel_size=(3, 3),
+                    padding=(dilation, dilation), dilation=(dilation, dilation)
+                )
+            )
             self.bns.append(nn.BatchNorm2d(hidden_size))
+            # Attention mechanism (Squeeze-and-Excitation block)
+            self.attentions.append(SqueezeExcitation(hidden_size))
 
-        # Last layer
-        self.conv_last = nn.Conv2d(hidden_size, in_channels, kernel_size=(3, 3), padding=(1, 1))
+        # Last layer for magnitude
+        self.conv_mag = nn.Conv2d(hidden_size, in_channels, kernel_size=(3, 3), padding=(1, 1))
+        # Last layer for phase
+        self.conv_phase = nn.Conv2d(hidden_size, in_channels, kernel_size=(3, 3), padding=(1, 1))
 
     def forward(self, x):
         # First layer
         x = F.relu(self.bn1(self.conv1(x)))
 
-        # Intermediate layers with residual connections and dilated convolutions
-        for i, (conv, bn) in enumerate(zip(self.convs, self.bns)):
+        # Intermediate layers with residual connections, dilated convolutions, and attention
+        for i, (conv, bn, attention) in enumerate(zip(self.convs, self.bns, self.attentions)):
             residual = x
-            x = F.relu(bn(conv(x)))
+            x = F.relu(bn(conv(x)))  # Dilated convolution
+            x = attention(x)  # Apply attention
             x = x + residual  # Residual connection
 
-        # Last layer
-        x = self.conv_last(x)
+        # Predict magnitude and phase
+        mag = self.conv_mag(x)
+        phase = self.conv_phase(x)
 
-        return x
+        return mag, phase
+
+# Squeeze-and-Excitation Block (Attention Mechanism)
+class SqueezeExcitation(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(SqueezeExcitation, self).__init__()
+        self.squeeze = nn.AdaptiveAvgPool2d(1)
+        self.excitation = nn.Sequential(
+            nn.Linear(channels, channels // reduction_ratio),
+            nn.ReLU(),
+            nn.Linear(channels // reduction_ratio, channels),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        # Global average pooling
+        scale = self.squeeze(x)
+        scale = scale.view(x.size(0), -1)  # Flatten
+        # Excitation
+        scale = self.excitation(scale)
+        scale = scale.view(x.size(0), -1, 1, 1)  # Reshape back to channel dimension
+        return x * scale  # Apply attention weights
+
+def loss_fn(pred_mag, pred_phase, target_mag, target_phase):
+    mag_loss = torch.mean((pred_mag - target_mag) ** 2)
+    phase_loss = torch.mean((pred_phase - target_phase) ** 2)
+    combined_loss = mag_loss + phase_loss
+    return combined_loss
 
 # Custom Dataset class with normalization and spectrogram conversion
 class MUSDBDataset(Dataset):
@@ -115,6 +156,9 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
     loss_log = []
     progress_bar = tqdm(total=epochs * len(dataloader))
 
+    # Initialize GradScaler for mixed precision training
+    scaler = GradScaler()
+
     if checkpoint_path:
         checkpoint = torch.load(checkpoint_path)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -130,12 +174,20 @@ def train(model, dataloader, optimizer, scheduler, loss_fn, device, epochs, chec
             mixture_spec = mixture_spec.to(device)
             vocals_spec = vocals_spec.to(device)
 
+            target_mag = torch.abs(vocals_spec)
+            target_phase = torch.angle(vocals_spec)
+
             optimizer.zero_grad()
-            vocals_spec_pred = model(mixture_spec)
-            loss = loss_fn(vocals_spec_pred, vocals_spec)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()  # Step the scheduler
+
+            with autocast():
+                pred_mag, pred_phase = model(mixture_spec)
+                loss = loss_fn(pred_mag, pred_phase, target_mag, target_phase)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
+            scheduler.step()
 
             avg_loss = (avg_loss * step + loss.item()) / (step + 1)
             loss_log.append(loss.item())
@@ -204,17 +256,19 @@ def inference(model, checkpoint_path, input_wav_path, output_instrumentals_path,
 
             # Inference
             with torch.no_grad():
-                vocals_mag_pred = model(chunk_mag_normalized)
-                inst_mag = chunk_mag_normalized - vocals_mag_pred
+                pred_mag, pred_phase = model(chunk_mag_normalized)
+                inst_mag = chunk_mag_normalized - pred_mag  # Instrumental magnitude
+                inst_phase = chunk_phase  # Use original phase for instrumental
 
             # Remove batch dimension
             inst_mag = inst_mag.squeeze(0)
+            pred_phase = pred_phase.squeeze(0)
 
             # Denormalize the output
             inst_mag = inst_mag * chunk_mag_std + chunk_mag_mean
 
             # Reconstruct the complex spectrogram
-            inst_spec = inst_mag * torch.exp(1j * chunk_phase)
+            inst_spec = inst_mag * torch.exp(1j * inst_phase)
 
             # Convert spectrogram back to waveform with Hann window
             inst_chunk = torch.istft(inst_spec, n_fft=n_fft, hop_length=hop_length, window=window, length=chunk_size, return_complex=False)
@@ -248,16 +302,16 @@ def main():
     parser = argparse.ArgumentParser(description='Train a model for music voice separation')
     parser.add_argument('--train', action='store_true', help='Train the model')
     parser.add_argument('--infer', action='store_true', help='Inference mode')
-    parser.add_argument('--data_dir', type=str, default='path/to/musdb18', help='Path to MUSDB18 training dataset')
+    parser.add_argument('--data_dir', type=str, default='train', help='Path to MUSDB18 training dataset')
     parser.add_argument('--epochs', type=int, default=10000, help='Number of epochs to train')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1.0, help='Learning rate')
-    parser.add_argument('--checkpoint_steps', type=int, default=1000, help='Save checkpoint every X steps')
+    parser.add_argument('--checkpoint_steps', type=int, default=100, help='Save checkpoint every X steps')
     parser.add_argument('--checkpoint_path', type=str, default=None, help='Path to checkpoint to resume from')
     parser.add_argument('--input_wav', type=str, default=None, help='Path to input WAV file for inference')
     parser.add_argument('--output_instrumental', type=str, default='output_instrumental.wav', help='Path to output instrumental WAV file')
-    parser.add_argument('--segment_length', type=int, default=264600, help='Segment length for training')
-    parser.add_argument('--num_layers', type=int, default=4, help='Number of layers in the CNN model')
+    parser.add_argument('--segment_length', type=int, default=352800, help='Segment length for training')
+    parser.add_argument('--num_layers', type=int, default=8, help='Number of layers in the CNN model')
     parser.add_argument('--n_fft', type=int, default=4096, help='Number of FFT bins for STFT')
     parser.add_argument('--hop_length', type=int, default=1024, help='Hop length for STFT')
     args = parser.parse_args()
@@ -267,12 +321,11 @@ def main():
     # Initialize model, optimizer, and loss function
     model = SimpleCNN(in_channels=2, hidden_size=512, num_layers=args.num_layers)
     optimizer = Prodigy(model.parameters(), lr=args.learning_rate, weight_decay=0.0)
-    loss_fn = nn.MSELoss()
 
     if args.train:
         # Create training dataset and dataloader
         train_dataset = MUSDBDataset(root_dir=args.data_dir, segment_length=args.segment_length, n_fft=args.n_fft, hop_length=args.hop_length, segment=True)
-        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+        train_dataloader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=16, pin_memory=False)
 
         # Initialize scheduler
         total_steps = args.epochs * len(train_dataloader)
